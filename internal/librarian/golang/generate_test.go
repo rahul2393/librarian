@@ -44,24 +44,31 @@ option go_package = "cloud.google.com/go/spanner/apiv1/spannerpb;spannerpb";
 message Result {
   google.spanner.v1.Type type = 1;
   google.protobuf.Value value = 2;
+  optional string resume_token = 3;
+  optional int64 affected_rows = 4 [deprecated = true];
 }
 
 service Spanner {
   rpc Execute(Result) returns (google.spanner.v1.Type) {}
 }
 `)
-	want := `syntax = "proto3";
+	want := `edition = "2023";
 
 package google.spanner.v1.internalopaque;
 
 import "librarian_opaque/google/spanner/v1/type.proto";
 import "librarian_opaque/google/protobuf/struct.proto";
+import "google/protobuf/go_features.proto";
 
 option go_package = "cloud.google.com/go/spanner/internal/opaquepb;opaquepb";
+option features.field_presence = IMPLICIT;
+option features.(pb.go).api_level = API_OPAQUE;
 
 message Result {
   google.spanner.v1.internalopaque.Type type = 1;
   google.spanner.v1.internalopaque.Value value = 2;
+  string resume_token = 3 [features.field_presence = EXPLICIT];
+  int64 affected_rows = 4 [deprecated = true, features.field_presence = EXPLICIT];
 }
 
 
@@ -96,9 +103,7 @@ func TestBuildOpaqueProtocArgs(t *testing.T) {
 		},
 	)
 	want := []string{
-		"--experimental_allow_proto3_optional",
 		"--go_out=/tmp/output",
-		"--go_opt=default_api_level=API_OPAQUE",
 		"--go_opt=Mlibrarian_opaque/google/protobuf/struct.proto=cloud.google.com/go/spanner/internal/opaquepb",
 		"--go_opt=Mlibrarian_opaque/google/spanner/v1/spanner.proto=cloud.google.com/go/spanner/internal/opaquepb",
 		"-I=/tmp/source",

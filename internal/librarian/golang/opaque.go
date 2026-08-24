@@ -39,6 +39,7 @@ var (
 	protoGoPackagePattern = regexp.MustCompile(`(?m)^[ \t]*option[ \t]+go_package[ \t]*=[ \t]*"[^"]*"[ \t]*;[^\n]*$`)
 	protoImportPattern    = regexp.MustCompile(`(?m)^([ \t]*import(?:[ \t]+(?:public|weak))?[ \t]+")([^"]+)(";[^\n]*$)`)
 	protoPackagePatternRE = regexp.MustCompile(`(?m)^[ \t]*package[ \t]+([A-Za-z_][A-Za-z0-9_.]*)[ \t]*;`)
+	proto3SyntaxPattern   = regexp.MustCompile(`(?m)^([ \t]*)syntax[ \t]*=[ \t]*"proto3"[ \t]*;([^\n]*)$`)
 	protoTypePattern      = regexp.MustCompile(`\b(?:message|enum)\s+([A-Za-z_][A-Za-z0-9_]*)`)
 )
 
@@ -227,13 +228,15 @@ func rewriteOpaqueProto(source []byte, targetPackage, goPackage string, imports 
 	if err != nil {
 		return nil, err
 	}
-	source = protoPackagePatternRE.ReplaceAll(source, []byte("package "+targetPackage+";"))
-	if protoGoPackagePattern.Match(source) {
-		source = protoGoPackagePattern.ReplaceAll(source, []byte("option go_package = \""+goPackage+"\";"))
-	} else {
-		packageEnd := protoPackagePatternRE.FindIndex(source)
-		source = bytes.Join([][]byte{source[:packageEnd[1]], []byte("\n\noption go_package = \"" + goPackage + "\";"), source[packageEnd[1]:]}, nil)
+	if !proto3SyntaxPattern.Match(source) {
+		return nil, errors.New("proto3 syntax declaration not found")
 	}
+	source, err = rewriteProto3OptionalFields(source)
+	if err != nil {
+		return nil, err
+	}
+	source = proto3SyntaxPattern.ReplaceAll(source, []byte(`${1}edition = "2023";${2}`))
+	source = protoPackagePatternRE.ReplaceAll(source, []byte("package "+targetPackage+";"))
 	source = protoImportPattern.ReplaceAllFunc(source, func(line []byte) []byte {
 		match := protoImportPattern.FindSubmatch(line)
 		if rewritten, ok := imports[string(match[2])]; ok {
@@ -241,6 +244,19 @@ func rewriteOpaqueProto(source []byte, targetPackage, goPackage string, imports 
 		}
 		return line
 	})
+	source = addProtoImport(source, "google/protobuf/go_features.proto")
+	if protoGoPackagePattern.Match(source) {
+		source = protoGoPackagePattern.ReplaceAll(source, []byte("option go_package = \""+goPackage+"\";"))
+	} else {
+		insert := protoPackagePatternRE.FindIndex(source)[1]
+		if matches := protoImportPattern.FindAllIndex(source, -1); len(matches) > 0 {
+			insert = matches[len(matches)-1][1]
+		}
+		source = bytes.Join([][]byte{source[:insert], []byte("\n\noption go_package = \"" + goPackage + "\";"), source[insert:]}, nil)
+	}
+	goPackageEnd := protoGoPackagePattern.FindIndex(source)[1]
+	features := []byte("\noption features.field_presence = IMPLICIT;\noption features.(pb.go).api_level = API_OPAQUE;")
+	source = bytes.Join([][]byte{source[:goPackageEnd], features, source[goPackageEnd:]}, nil)
 
 	packages := make([]string, 0, len(types))
 	for pkg := range types {
@@ -261,11 +277,98 @@ func rewriteOpaqueProto(source []byte, targetPackage, goPackage string, imports 
 	return source, nil
 }
 
+func addProtoImport(source []byte, proto string) []byte {
+	for _, match := range protoImportPattern.FindAllSubmatch(source, -1) {
+		if string(match[2]) == proto {
+			return source
+		}
+	}
+	insert := protoPackagePatternRE.FindIndex(source)[1]
+	if matches := protoImportPattern.FindAllIndex(source, -1); len(matches) > 0 {
+		insert = matches[len(matches)-1][1]
+	}
+	return bytes.Join([][]byte{source[:insert], []byte("\nimport \"" + proto + "\";"), source[insert:]}, nil)
+}
+
+func rewriteProto3OptionalFields(source []byte) ([]byte, error) {
+	for offset := 0; offset < len(source); {
+		start, end, ok := findProtoIdentifier(source, offset, "optional")
+		if !ok {
+			return source, nil
+		}
+		statementEnd, optionEnd, err := findProtoFieldEnd(source, end)
+		if err != nil {
+			return nil, err
+		}
+		removeEnd := end
+		for removeEnd < len(source) && (source[removeEnd] == ' ' || source[removeEnd] == '\t') {
+			removeEnd++
+		}
+		source = append(source[:start], source[removeEnd:]...)
+		removed := removeEnd - start
+		statementEnd -= removed
+		optionEnd -= removed
+		feature := []byte("features.field_presence = EXPLICIT")
+		if optionEnd >= 0 {
+			source = bytes.Join([][]byte{source[:optionEnd], []byte(", "), feature, source[optionEnd:]}, nil)
+			offset = statementEnd + len(feature) + 2
+			continue
+		}
+		source = bytes.Join([][]byte{source[:statementEnd], []byte(" ["), feature, []byte("]"), source[statementEnd:]}, nil)
+		offset = statementEnd + len(feature) + 3
+	}
+	return source, nil
+}
+
+func findProtoIdentifier(source []byte, offset int, want string) (int, int, bool) {
+	for i := offset; i < len(source); {
+		if next := skipProtoCommentOrString(source, i); next != i {
+			i = next
+			continue
+		}
+		if !isProtoIdentifierStart(source[i]) {
+			i++
+			continue
+		}
+		start := i
+		for i < len(source) && isProtoIdentifierPart(source[i]) {
+			i++
+		}
+		if string(source[start:i]) == want {
+			return start, i, true
+		}
+	}
+	return 0, 0, false
+}
+
+func findProtoFieldEnd(source []byte, offset int) (int, int, error) {
+	optionDepth := 0
+	optionEnd := -1
+	for i := offset; i < len(source); i++ {
+		if next := skipProtoCommentOrString(source, i); next != i {
+			i = next - 1
+			continue
+		}
+		switch source[i] {
+		case '[':
+			optionDepth++
+		case ']':
+			optionDepth--
+			if optionDepth == 0 {
+				optionEnd = i
+			}
+		case ';':
+			if optionDepth == 0 {
+				return i, optionEnd, nil
+			}
+		}
+	}
+	return 0, 0, errors.New("unterminated optional field")
+}
+
 func buildOpaqueProtocArgs(sourceDir, googleapisDir, includeDir, outputDir, importPath string, protoPaths []string) []string {
 	args := []string{
-		"--experimental_allow_proto3_optional",
 		"--go_out=" + outputDir,
-		"--go_opt=default_api_level=API_OPAQUE",
 	}
 	for _, proto := range protoPaths {
 		args = append(args, "--go_opt=M"+proto+"="+importPath)
